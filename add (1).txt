@@ -1,0 +1,470 @@
+ARCPITCH ADMOB EKLEME PLANI
+============================
+
+Amaç:
+- Google Mobile Ads (AdMob) aktif olacak.
+- Interstitial reklamlar bölüm bitişlerinde, her 3 tamamlamada bir gösterilecek.
+- Rewarded reklamlar mevcut EXTRA_SHOT / DOUBLE_LEVEL_COINS / ENERGY_HEART akışına bağlanacak.
+- UMP gizlilik/izin akışı aktif olacak.
+- Geliştirme sırasında SADECE Google test reklam kimlikleri kullanılacak.
+
+ÖNEMLİ:
+Bu dosyadaki reklam kimlikleri Google'ın TEST kimlikleridir.
+Google Play'e göndermeden önce kendi AdMob App ID, Interstitial Ad Unit ID ve Rewarded Ad Unit ID değerlerinle değiştir.
+
+
+1) android/build.gradle
+=======================
+
+Mevcut:
+    minSdkVersion 21
+
+Şuna değiştir:
+    minSdkVersion 23
+
+repositories bloğunu:
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+şeklinde yap.
+
+dependencies bloğuna, mevcut satırları SİLMEDEN şunları ekle:
+
+    implementation "com.google.android.gms:play-services-ads:25.3.0"
+    implementation "com.google.android.ump:user-messaging-platform:4.0.0"
+
+Play Games V2 ekleme.
+Mevcut Play Integrity bağımlılığın varsa onu olduğu gibi bırak.
+
+
+2) android/src/main/AndroidManifest.xml
+=======================================
+
+<application ...> bloğunun içine, <activity> satırından ÖNCE şunu ekle:
+
+        <!-- TEST AdMob App ID. Yayından önce kendi App ID'n ile değiştir. -->
+        <meta-data
+            android:name="com.google.android.gms.ads.APPLICATION_ID"
+            android:value="ca-app-pub-3940256099942544~3347511713" />
+
+INTERNET ve ACCESS_NETWORK_STATE izinleri projede zaten varsa tekrar ekleme.
+
+Google Mobile Ads SDK 20.4.0+ AD_ID iznini kendi manifesti üzerinden eklediği için
+ayrıca com.google.android.gms.permission.AD_ID satırı eklemek zorunlu değildir.
+
+
+3) AndroidAdsManager.java
+=========================
+
+Dosya:
+android/src/main/java/com/victoriumsoft/arcpitch/android/AndroidAdsManager.java
+
+Mevcut dosyanın TAMAMINI aşağıdaki kodla değiştir:
+
+------------------------------------------------------------
+package com.victoriumsoft.arcpitch.android;
+
+import android.app.Activity;
+
+import com.google.android.gms.ads.AdError;
+import com.google.android.gms.ads.AdRequest;
+import com.google.android.gms.ads.FullScreenContentCallback;
+import com.google.android.gms.ads.LoadAdError;
+import com.google.android.gms.ads.MobileAds;
+import com.google.android.gms.ads.interstitial.InterstitialAd;
+import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback;
+import com.google.android.gms.ads.rewarded.RewardedAd;
+import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback;
+
+import com.google.android.ump.ConsentInformation;
+import com.google.android.ump.ConsentRequestParameters;
+import com.google.android.ump.UserMessagingPlatform;
+
+import com.victoriumsoft.arcpitch.ads.AdsManager;
+import com.victoriumsoft.arcpitch.ads.RewardType;
+import com.victoriumsoft.arcpitch.ads.RewardedAdCallback;
+
+public final class AndroidAdsManager implements AdsManager {
+
+    /*
+     * GOOGLE TEST REKLAM KİMLİKLERİ.
+     * YAYINDAN ÖNCE KENDİ ADMOB AD UNIT ID'LERİNLE DEĞİŞTİR.
+     */
+    private static final String TEST_INTERSTITIAL_AD_UNIT_ID =
+        "ca-app-pub-3940256099942544/1033173712";
+
+    private static final String TEST_REWARDED_AD_UNIT_ID =
+        "ca-app-pub-3940256099942544/5224354917";
+
+    /*
+     * Oyuncuyu reklamla boğmamak için interstitial reklam
+     * her 3 tamamlanan bölümden sonra uygun hale gelir.
+     */
+    private static final int INTERSTITIAL_EVERY_N_COMPLETIONS = 3;
+
+    private final Activity activity;
+    private final ConsentInformation consentInformation;
+
+    private InterstitialAd interstitialAd;
+    private RewardedAd rewardedAd;
+
+    private boolean mobileAdsStartRequested;
+    private boolean mobileAdsInitialized;
+    private int completedLevelsSinceInterstitial;
+
+    public AndroidAdsManager(Activity activity) {
+        this.activity = activity;
+        this.consentInformation =
+            UserMessagingPlatform.getConsentInformation(activity);
+    }
+
+    @Override
+    public void initialize() {
+        activity.runOnUiThread(() -> {
+            ConsentRequestParameters params =
+                new ConsentRequestParameters.Builder().build();
+
+            /*
+             * UMP bilgisi her uygulama açılışında güncellenir.
+             */
+            consentInformation.requestConsentInfoUpdate(
+                activity,
+                params,
+                () -> UserMessagingPlatform.loadAndShowConsentFormIfRequired(
+                    activity,
+                    formError -> startAdsIfAllowed()
+                ),
+                requestConsentError -> startAdsIfAllowed()
+            );
+
+            /*
+             * Önceki oturumdan geçerli izin varsa reklamları
+             * izin formunun sonucunu gereksiz yere bekletmeden başlatabilir.
+             */
+            startAdsIfAllowed();
+        });
+    }
+
+    private void startAdsIfAllowed() {
+        if (!consentInformation.canRequestAds()) {
+            return;
+        }
+
+        if (mobileAdsStartRequested) {
+            return;
+        }
+
+        mobileAdsStartRequested = true;
+
+        MobileAds.initialize(
+            activity,
+            initializationStatus -> {
+                mobileAdsInitialized = true;
+                loadInterstitial();
+                loadRewarded();
+            }
+        );
+    }
+
+    private void loadInterstitial() {
+        if (!mobileAdsInitialized || !consentInformation.canRequestAds()) {
+            return;
+        }
+
+        InterstitialAd.load(
+            activity,
+            TEST_INTERSTITIAL_AD_UNIT_ID,
+            new AdRequest.Builder().build(),
+            new InterstitialAdLoadCallback() {
+                @Override
+                public void onAdLoaded(InterstitialAd ad) {
+                    interstitialAd = ad;
+                }
+
+                @Override
+                public void onAdFailedToLoad(LoadAdError loadAdError) {
+                    interstitialAd = null;
+                }
+            }
+        );
+    }
+
+    private void loadRewarded() {
+        if (!mobileAdsInitialized || !consentInformation.canRequestAds()) {
+            return;
+        }
+
+        RewardedAd.load(
+            activity,
+            TEST_REWARDED_AD_UNIT_ID,
+            new AdRequest.Builder().build(),
+            new RewardedAdLoadCallback() {
+                @Override
+                public void onAdLoaded(RewardedAd ad) {
+                    rewardedAd = ad;
+                }
+
+                @Override
+                public void onAdFailedToLoad(LoadAdError loadAdError) {
+                    rewardedAd = null;
+                }
+            }
+        );
+    }
+
+    @Override
+    public void recordLevelCompleted(int levelNumber) {
+        completedLevelsSinceInterstitial++;
+    }
+
+    @Override
+    public void showInterstitialIfEligible(
+        int levelNumber,
+        Runnable onClosed
+    ) {
+        activity.runOnUiThread(() -> {
+            if (!consentInformation.canRequestAds()
+                || completedLevelsSinceInterstitial
+                    < INTERSTITIAL_EVERY_N_COMPLETIONS
+                || interstitialAd == null) {
+
+                if (onClosed != null) {
+                    onClosed.run();
+                }
+
+                if (interstitialAd == null) {
+                    loadInterstitial();
+                }
+
+                return;
+            }
+
+            InterstitialAd adToShow = interstitialAd;
+            interstitialAd = null;
+            completedLevelsSinceInterstitial = 0;
+
+            adToShow.setFullScreenContentCallback(
+                new FullScreenContentCallback() {
+                    @Override
+                    public void onAdDismissedFullScreenContent() {
+                        loadInterstitial();
+
+                        if (onClosed != null) {
+                            onClosed.run();
+                        }
+                    }
+
+                    @Override
+                    public void onAdFailedToShowFullScreenContent(
+                        AdError adError
+                    ) {
+                        loadInterstitial();
+
+                        if (onClosed != null) {
+                            onClosed.run();
+                        }
+                    }
+                }
+            );
+
+            adToShow.show(activity);
+        });
+    }
+
+    @Override
+    public boolean isRewardedReady() {
+        return consentInformation.canRequestAds()
+            && rewardedAd != null;
+    }
+
+    @Override
+    public void showRewarded(
+        RewardType rewardType,
+        RewardedAdCallback callback
+    ) {
+        activity.runOnUiThread(() -> {
+            if (!consentInformation.canRequestAds()
+                || rewardedAd == null) {
+
+                if (callback != null) {
+                    callback.onAdUnavailable();
+                }
+
+                loadRewarded();
+                return;
+            }
+
+            RewardedAd adToShow = rewardedAd;
+            rewardedAd = null;
+
+            adToShow.setFullScreenContentCallback(
+                new FullScreenContentCallback() {
+                    @Override
+                    public void onAdDismissedFullScreenContent() {
+                        loadRewarded();
+                    }
+
+                    @Override
+                    public void onAdFailedToShowFullScreenContent(
+                        AdError adError
+                    ) {
+                        loadRewarded();
+
+                        if (callback != null) {
+                            callback.onAdUnavailable();
+                        }
+                    }
+                }
+            );
+
+            adToShow.show(
+                activity,
+                rewardItem -> {
+                    /*
+                     * Ödülü core tarafındaki mevcut callback uygular.
+                     * EXTRA_SHOT / DOUBLE_LEVEL_COINS / ENERGY_HEART
+                     * davranışları bu sayede oyun kodunda kalır.
+                     */
+                    if (callback != null) {
+                        callback.onRewardEarned();
+                    }
+                }
+            );
+        });
+    }
+
+    @Override
+    public boolean isPrivacyOptionsRequired() {
+        return consentInformation.getPrivacyOptionsRequirementStatus()
+            == ConsentInformation.PrivacyOptionsRequirementStatus.REQUIRED;
+    }
+
+    @Override
+    public void showPrivacyOptions(Runnable onClosed) {
+        activity.runOnUiThread(() ->
+            UserMessagingPlatform.showPrivacyOptionsForm(
+                activity,
+                formError -> {
+                    startAdsIfAllowed();
+
+                    if (onClosed != null) {
+                        onClosed.run();
+                    }
+                }
+            )
+        );
+    }
+
+    @Override
+    public String getStatusText() {
+        if (!consentInformation.canRequestAds()) {
+            return "ADS WAITING FOR CONSENT";
+        }
+
+        if (!mobileAdsInitialized) {
+            return "ADS STARTING";
+        }
+
+        if (interstitialAd != null || rewardedAd != null) {
+            return "ADS READY";
+        }
+
+        return "ADS LOADING";
+    }
+
+    @Override
+    public void dispose() {
+        interstitialAd = null;
+        rewardedAd = null;
+    }
+}
+------------------------------------------------------------
+
+
+4) RewardedAdCallback kontrolü
+==============================
+
+Core tarafında şu dosyayı kontrol et:
+
+core/src/main/java/com/victoriumsoft/arcpitch/ads/RewardedAdCallback.java
+
+İçinde şu iki metodun bulunması gerekir:
+
+    void onRewardEarned();
+
+    default void onAdUnavailable() {
+    }
+
+Eğer onRewardEarned() zaten varsa SİLME.
+Mevcut callback kullanan GameScreen ve EnergyScreen kodlarını değiştirme.
+Projede EXTRA_SHOT, DOUBLE_LEVEL_COINS ve ENERGY_HEART zaten RewardType olarak bulunuyor.
+
+
+5) Derleme
+===========
+
+PowerShell:
+
+    $env:JAVA_HOME = 'C:\Program Files\Java\jdk-17.0.20+8'
+    $env:Path = "$env:JAVA_HOME\bin;$env:Path"
+
+    .\gradlew.bat --stop
+    .\gradlew.bat :android:clean
+    .\gradlew.bat :android:assembleDebug --no-daemon
+
+APK ara:
+
+    Get-ChildItem .\android\build -Recurse -Filter *.apk |
+        Select-Object -ExpandProperty FullName
+
+
+6) TEST
+=======
+
+Debug sürümünde test reklamları kullanılmalı.
+
+Test AdMob App ID:
+    ca-app-pub-3940256099942544~3347511713
+
+Test Interstitial:
+    ca-app-pub-3940256099942544/1033173712
+
+Test Rewarded:
+    ca-app-pub-3940256099942544/5224354917
+
+Gerçek AdMob reklam kimliklerini debug sırasında kullanıp reklamlara tıklama.
+Google test reklamları geliştirme sırasında güvenli test için vardır.
+
+
+7) GOOGLE PLAY'E GÖNDERMEDEN ÖNCE
+==================================
+
+ZORUNLU KONTROL:
+
+[ ] Test App ID -> gerçek AdMob App ID
+[ ] Test Interstitial ID -> gerçek Interstitial Ad Unit ID
+[ ] Test Rewarded ID -> gerçek Rewarded Ad Unit ID
+[ ] AdMob hesabında uygulama/package:
+    com.victoriumsoft.arcpitch
+    ile eşleşiyor
+[ ] AdMob Privacy & messaging bölümünde gerekli GDPR/EEA mesajı ayarlandı
+[ ] Google Play Data safety reklam kullanımıyla uyumlu güncellendi
+[ ] Gizlilik politikası güncellendi
+
+Mevcut ArcPitch gizlilik politikasında reklam servislerinden "gelecekte etkinleştirilirse"
+şeklinde bahsediliyorsa, reklamı aktif ettikten sonra bu ifade artık doğru değildir.
+Yayından önce Google Mobile Ads / AdMob ve gerekli veri işleme açıklamaları açıkça yazılmalıdır.
+
+
+8) NOT
+======
+
+Bu entegrasyon:
+- Oyunun core gameplay kodunu reklam SDK'sına bağımlı yapmaz.
+- AndroidAdsManager Android tarafında kalır.
+- Rewarded ödülleri mevcut core callback sistemi üzerinden verilir.
+- Reklam yüklenmezse bölüm geçişi takılmaz.
+- Kullanıcı izin veremiyorsa/izin henüz alınmamışsa reklam isteği yapılmaz.
+- Interstitial reklam sadece mevcut showInterstitialIfEligible() noktalarında gösterilir.
